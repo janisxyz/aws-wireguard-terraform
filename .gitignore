@@ -4,13 +4,9 @@
 *.tfplan
 terraform.tfvars
 *.auto.tfvars
-crash.log
-crash.*.log
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
+*.log
 wireguard-client.conf
 *.png
 *.key
 *.pem
+.DS_Store
