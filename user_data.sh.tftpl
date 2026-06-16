@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+exec > >(tee -a /var/log/wireguard-bootstrap.log | logger -t wireguard-bootstrap -s 2>/dev/console) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+
+for attempt in 1 2 3 4 5; do
+  if apt-get update -y; then
+    break
+  fi
+  sleep $((attempt * 5))
+done
+
+apt-get install -y --no-install-recommends ca-certificates curl iptables unzip wireguard-tools
+
+if ! command -v aws >/dev/null 2>&1; then
+  if ! apt-get install -y --no-install-recommends awscli; then
+    curl -fsSLo /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+    rm -rf /tmp/aws
+    unzip -q /tmp/awscliv2.zip -d /tmp
+    /tmp/aws/install --update
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+  fi
+fi
+
+install -d -m 700 /etc/wireguard
+umask 077
+
+SERVER_PRIVATE_KEY="$(wg genkey)"
+SERVER_PUBLIC_KEY="$(printf '%s' "$SERVER_PRIVATE_KEY" | wg pubkey)"
+CLIENT_PRIVATE_KEY="$(wg genkey)"
+CLIENT_PUBLIC_KEY="$(printf '%s' "$CLIENT_PRIVATE_KEY" | wg pubkey)"
+DEFAULT_INTERFACE="$(ip -o -4 route show to default | awk '{print $5; exit}')"
+
+test -n "$DEFAULT_INTERFACE"
+
+cat >/etc/sysctl.d/99-wireguard.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+SYSCTL
+sysctl --system
+
+cat >/etc/wireguard/wg0.conf <<EOF_WG
+[Interface]
+Address = ${server_address}
+PrivateKey = $SERVER_PRIVATE_KEY
+ListenPort = ${wireguard_port}
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o $DEFAULT_INTERFACE -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o $DEFAULT_INTERFACE -j MASQUERADE
+
+[Peer]
+PublicKey = $CLIENT_PUBLIC_KEY
+AllowedIPs = ${client_address}
+EOF_WG
+
+chmod 600 /etc/wireguard/wg0.conf
+systemctl enable wg-quick@wg0
+systemctl restart wg-quick@wg0
+
+systemctl enable --now amazon-ssm-agent 2>/dev/null || \
+  systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/dev/null || true
+
+CLIENT_CONFIG="$(cat <<EOF_CLIENT
+[Interface]
+PrivateKey = $CLIENT_PRIVATE_KEY
+Address = ${client_address}
+DNS = ${client_dns_servers}
+MTU = ${client_mtu}
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = ${endpoint_ip}:${wireguard_port}
+AllowedIPs = ${client_allowed_ips}
+PersistentKeepalive = 25
+EOF_CLIENT
+)"
+
+for attempt in $(seq 1 12); do
+  if aws ssm put-parameter \
+    --region "${aws_region}" \
+    --name "${client_config_parameter}" \
+    --type SecureString \
+    --value "$CLIENT_CONFIG" \
+    --overwrite; then
+    break
+  fi
+
+  if [ "$attempt" -eq 12 ]; then
+    printf '%s\n' "Failed to publish the WireGuard client configuration to SSM." >&2
+    exit 1
+  fi
+
+  sleep 10
+done
+
+wg show
+printf '%s\n' "WireGuard bootstrap completed successfully."
